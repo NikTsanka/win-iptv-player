@@ -1,0 +1,30 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Ll]og/
+*.binlog
+
+# .NET / Visual Studio
+.vs/
+*.user
+*.suo
+*.userprefs
+project.lock.json
+artifacts/
+
+# Rider / VS Code
+.idea/
+.vscode/
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# NuGet
+*.nupkg
+packages/
+.nuget/

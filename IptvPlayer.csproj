@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <!-- WinForms is enabled so we can host the video in a WindowsFormsHost + Panel and
+         hand libvlc the panel's HWND directly. This avoids LibVLCSharp.WPF VideoView's
+         DWM-thumbnail compositing, which fails (SetThumbNailClip 0x800706f4) on this GPU
+         and produces a white/blank video surface. -->
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>IptvPlayer</RootNamespace>
+    <AssemblyName>IptvPlayer</AssemblyName>
+    <!-- LibVLC native binaries are x64-only here. -->
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Only the .NET 10 Desktop runtime is installed on this machine, so allow a
+         net8.0 build to roll forward onto it. Remove once a .NET 8 runtime is present. -->
+    <RollForward>LatestMajor</RollForward>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Exact, mutually compatible versions (LibVLCSharp 3.8.x line). -->
+    <PackageReference Include="LibVLCSharp" Version="3.8.2" />
+    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.21" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.3.2" />
+  </ItemGroup>
+
+</Project>
