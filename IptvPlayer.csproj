@@ -18,6 +18,7 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>assets\icon.ico</ApplicationIcon>
     <!-- Only the .NET 10 Desktop runtime is installed on this machine, so allow a
          net8.0 build to roll forward onto it. Remove once a .NET 8 runtime is present. -->
     <RollForward>LatestMajor</RollForward>

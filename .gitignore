@@ -5,6 +5,10 @@
 [Ll]og/
 *.binlog
 
+# Publish / installer artifacts
+publish/
+installer-output/
+
 # .NET / Visual Studio
 .vs/
 *.user

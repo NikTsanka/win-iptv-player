@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Linq;
@@ -35,21 +36,44 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private readonly DispatcherTimer _zapTimer =
         new() { Interval = TimeSpan.FromMilliseconds(350) };
 
-    // Serialized background playback worker. Channel switching tears down the previous
-    // stream (a BLOCKING native call) off the UI thread, then issues Play() back on the
-    // UI thread. Only the latest requested channel is played (coalescing).
+    // ALL libvlc calls run on this single dedicated thread — NEVER on the UI thread.
+    // libvlc operations (Play/Stop/Volume/AspectRatio) take an internal lock and can
+    // block for seconds on heavy 4K streams; doing them on the UI thread froze and
+    // dead-locked the app (confirmed by dotnet-stack). The UI only posts work here.
+    private readonly BlockingCollection<Action> _vlcQueue = new();
+    private readonly Thread _vlcThread;
     private readonly object _playGate = new();
     private Channel? _pendingPlay;
-    private bool _playWorkerActive;
+
+    // Tracks the channel currently being started, so the native-log handler can detect a
+    // 10-bit-HDR hardware-decode failure and transparently retry it in software.
+    private volatile Channel? _playingChannel;
+    private volatile bool _triedSoftwareForCurrent;
 
     public MediaPlayer MediaPlayer => _mediaPlayer;
 
     // Hand libvlc the native window handle of the WinForms panel that hosts the video.
     // Direct HWND embedding renders straight into the child window (no DWM thumbnail).
-    public void SetVideoHandle(IntPtr hwnd)
+    public void SetVideoHandle(IntPtr hwnd) => PostVlc(() =>
     {
         _mediaPlayer.Hwnd = hwnd;
         Log.Write($"SetVideoHandle hwnd=0x{hwnd.ToInt64():X}");
+    });
+
+    // Queue a libvlc operation onto the dedicated VLC thread.
+    private void PostVlc(Action op)
+    {
+        if (_disposed) return;
+        try { _vlcQueue.Add(op); } catch (InvalidOperationException) { /* queue completed */ }
+    }
+
+    private void VlcThreadLoop()
+    {
+        foreach (var op in _vlcQueue.GetConsumingEnumerable())
+        {
+            try { op(); }
+            catch (Exception ex) { Log.Write("vlc op ERROR: " + ex); }
+        }
     }
 
     public ObservableCollection<Channel> AllChannels { get; } = new();
@@ -74,14 +98,18 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         Log.Write("VM ctor: creating LibVLC + MediaPlayer");
 
         // Core.Initialize() already ran in App.OnStartup -> safe to construct LibVLC now.
-        // --vout=directdraw renders straight into the embedded HWND (no DXGI swapchain),
-        // which the direct3d11 vout fails to composite over this GPU/airspace combo.
-        _libVLC = new LibVLC(
-            "--vout=directdraw",
-            "--no-snapshot-preview");
-        _libVLC.Log += OnVlcNativeLog;     // DIAGNOSTIC: capture vout / decoder messages
+        // Hardware decode stays ON (smooth 8-bit). Per the native log, this GPU can't do
+        // 10-bit HEVC in hardware; such channels are retried in software automatically
+        // (see OnVlcNativeLog). NOTE: global LibVLC options are unreliable here, so all
+        // decoder tuning is applied per-media via Media.AddOption instead.
+        _libVLC = new LibVLC();
+        _libVLC.Log += OnVlcNativeLog;     // capture vout / decoder messages (+ HDR retry)
         _mediaPlayer = new MediaPlayer(_libVLC);
         WireMediaPlayerEvents();
+
+        // The dedicated VLC operations thread (owns every libvlc call).
+        _vlcThread = new Thread(VlcThreadLoop) { IsBackground = true, Name = "vlc-ops" };
+        _vlcThread.Start();
 
         // CollectionView gives us live group + favorites filtering over one source list.
         ChannelsView = CollectionViewSource.GetDefaultView(AllChannels);
@@ -120,8 +148,8 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             var clamped = Math.Clamp(value, 0, 100);
             if (SetProperty(ref _volume, clamped))
             {
-                _mediaPlayer.Volume = clamped;          // 3.8.x: int 0..100
                 _appSettings.Volume = clamped;
+                PostVlc(() => _mediaPlayer.Volume = clamped);   // off the UI thread
             }
         }
     }
@@ -135,9 +163,9 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         {
             if (SetProperty(ref _aspectRatio, value))
             {
-                // null tells libvlc to use the source's native ratio.
-                _mediaPlayer.AspectRatio = value == "Auto" ? null : value;
                 _appSettings.AspectRatio = value;
+                var ar = value == "Auto" ? null : value;   // null = source's native ratio
+                PostVlc(() => _mediaPlayer.AspectRatio = ar);   // off the UI thread
             }
         }
     }
@@ -171,23 +199,35 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         else d.BeginInvoke(action);
     }
 
-    // DIAGNOSTIC: keep only the signal — warnings/errors plus anything about the video
-    // output, hardware decoding or HEVC. This tells us WHY a 4K channel is audio-only.
-    private static void OnVlcNativeLog(object? sender, LogEventArgs e)
+    // Watches libvlc's native log. Its main job now: detect a hardware-decode failure on
+    // a 10-bit HDR stream ("Unsupported bitdepth 10" / "Failed to create video converter")
+    // and transparently restart the SAME channel with software decoding forced. 8-bit
+    // channels never hit this, so they keep smooth hardware decode.
+    private void OnVlcNativeLog(object? sender, LogEventArgs e)
     {
         try
         {
             var m = e.Message ?? string.Empty;
-            var keep = e.Level >= LogLevel.Warning
-                || m.Contains("vout", StringComparison.OrdinalIgnoreCase)
-                || m.Contains("hevc", StringComparison.OrdinalIgnoreCase)
-                || m.Contains("h265", StringComparison.OrdinalIgnoreCase)
-                || m.Contains("decoder", StringComparison.OrdinalIgnoreCase)
-                || m.Contains("hardware", StringComparison.OrdinalIgnoreCase)
-                || m.Contains("dxva", StringComparison.OrdinalIgnoreCase)
-                || m.Contains("direct3d", StringComparison.OrdinalIgnoreCase)
-                || m.Contains("d3d11", StringComparison.OrdinalIgnoreCase);
-            if (keep)
+
+            var hwDecodeFailed =
+                m.Contains("Unsupported bitdepth", StringComparison.OrdinalIgnoreCase) ||
+                m.Contains("Failed to create video converter", StringComparison.OrdinalIgnoreCase);
+
+            if (hwDecodeFailed)
+            {
+                var ch = _playingChannel;
+                if (ch is not null && !_triedSoftwareForCurrent)
+                {
+                    _triedSoftwareForCurrent = true;     // guard against a retry loop
+                    Log.Write($"HDR/10-bit hw decode failed for #{ch.Number} {ch.Name} -> retry in software");
+                    PostVlc(() => DoPlay(ch, forceSoftware: true));
+                }
+            }
+
+            if (e.Level >= LogLevel.Warning ||
+                m.Contains("vout", StringComparison.OrdinalIgnoreCase) ||
+                m.Contains("bitdepth", StringComparison.OrdinalIgnoreCase) ||
+                m.Contains("converter", StringComparison.OrdinalIgnoreCase))
                 Log.Write($"VLCLOG [{e.Level}] {e.Module}: {m}");
         }
         catch { /* never throw from a log callback */ }
@@ -281,86 +321,64 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     }
 
     // ---- Transport -------------------------------------------------------------------
-    // Called on the UI thread (from the debounce timer). Hands the channel to the
-    // serialized background worker instead of playing inline — because the inline
-    // MediaPlayer.Play() -> set_Media call BLOCKS the UI thread while it stops the
-    // previous heavy 4K stream (confirmed by a dotnet-stack capture of the freeze).
+    // Called on the UI thread. Records the latest requested channel and queues a drain
+    // op on the VLC thread. Coalescing: if several channels are queued, the first drain
+    // plays the most-recent one and later drains find nothing to do.
     private void Play(Channel channel)
     {
         if (string.IsNullOrWhiteSpace(channel.StreamUrl)) return;
-
         StatusText = $"> {channel.Name}";
-
-        lock (_playGate)
-        {
-            _pendingPlay = channel;       // newest request wins (coalescing)
-            if (_playWorkerActive) return;
-            _playWorkerActive = true;
-        }
-        Task.Run(PlayWorkerLoop);
+        lock (_playGate) _pendingPlay = channel;
+        PostVlc(PlayLatest);
     }
 
-    private void PlayWorkerLoop()
+    private void PlayLatest()
     {
-        while (true)
+        Channel? target;
+        lock (_playGate) { target = _pendingPlay; _pendingPlay = null; }
+        if (target is not null) DoPlay(target, forceSoftware: false);
+    }
+
+    // Runs ONLY on the VLC thread. Stop + Play are blocking native calls; that's fine
+    // here. forceSoftware is set when a 10-bit HDR stream failed hardware decode.
+    private void DoPlay(Channel channel, bool forceSoftware)
+    {
+        if (_disposed) return;
+        try
         {
-            if (_disposed) { lock (_playGate) { _playWorkerActive = false; } return; }
+            Log.Write($"DoPlay #{channel.Number} {channel.Name} sw={forceSoftware}");
+            _mediaPlayer.Stop();
 
-            Channel target;
-            lock (_playGate)
-            {
-                if (_pendingPlay is null) { _playWorkerActive = false; return; }
-                target = _pendingPlay;
-                _pendingPlay = null;
-            }
+            var prev = Interlocked.Exchange(ref _currentMedia, null);
+            prev?.Dispose();
 
-            try
-            {
-                // 1) BLOCKING teardown of the current stream — safe on this bg thread.
-                Log.Write($"worker: Stop() before #{target.Number} {target.Name}");
-                _mediaPlayer.Stop();
-                Log.Write("worker: Stop() returned");
+            var media = Uri.TryCreate(channel.StreamUrl, UriKind.Absolute, out var uri)
+                ? new Media(_libVLC, uri)
+                : new Media(_libVLC, channel.StreamUrl, FromType.FromPath);
+            media.AddOption(":network-caching=1500");
+            if (forceSoftware)
+                media.AddOption(":avcodec-hw=none");   // per-media (global options ignored)
 
-                var prev = Interlocked.Exchange(ref _currentMedia, null);
-                prev?.Dispose();
-
-                // 2) Build the new media (cheap).
-                var media = Uri.TryCreate(target.StreamUrl, UriKind.Absolute, out var uri)
-                    ? new Media(_libVLC, uri)
-                    : new Media(_libVLC, target.StreamUrl, FromType.FromPath);
-                media.AddOption(":network-caching=1500");
-
-                // 3) Play on the UI thread (required for the VideoView to render). After
-                //    the Stop() above there is nothing to tear down, so it returns fast.
-                var dispatcher = Application.Current?.Dispatcher;
-                if (dispatcher is null) { media.Dispose(); return; }
-
-                Log.Write("worker: invoking Play() on UI thread");
-                dispatcher.Invoke(() =>
-                {
-                    if (_disposed) { media.Dispose(); return; }
-                    _mediaPlayer.Play(media);
-                    _currentMedia = media;
-                });
-                Log.Write("worker: Play() issued on UI thread");
-            }
-            catch (Exception ex)
-            {
-                Log.Write("worker: ERROR " + ex);
-            }
+            _playingChannel = channel;
+            _triedSoftwareForCurrent = forceSoftware;
+            _mediaPlayer.Play(media);
+            _currentMedia = media;
+        }
+        catch (Exception ex)
+        {
+            Log.Write("DoPlay ERROR: " + ex);
         }
     }
 
     [RelayCommand]
-    private void PlayPause()
+    private void PlayPause() => PostVlc(() =>
     {
         if (_mediaPlayer.IsPlaying) _mediaPlayer.Pause();
         else if (_mediaPlayer.Media is not null) _mediaPlayer.Play();
-        else if (SelectedChannel is not null) Play(SelectedChannel);
-    }
+    });
 
     [RelayCommand]
-    private void Stop() => Task.Run(() => { try { _mediaPlayer.Stop(); } catch { /* ignore */ } });
+    private void Stop() => PostVlc(() => _mediaPlayer.Stop());
 
     [RelayCommand]
     private void NextChannel() => Step(+1);
@@ -400,8 +418,11 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
 
         _zapTimer.Stop();
 
-        // Do NOT call MediaPlayer.Stop() here — it is a blocking native call and can
-        // deadlock on shutdown. Disposing the player tears playback down safely.
+        // Stop accepting new work and let the VLC thread finish its current op, so we
+        // never dispose the player out from under an in-flight native call.
+        _vlcQueue.CompleteAdding();
+        try { _vlcThread.Join(3000); } catch { /* ignore */ }
+
         _mediaPlayer.Dispose();
         _currentMedia?.Dispose();
         _libVLC.Dispose();
