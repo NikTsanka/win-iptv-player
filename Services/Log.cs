@@ -10,6 +10,10 @@ namespace IptvPlayer.Services;
 /// </summary>
 public static class Log
 {
+    // OFF by default: file I/O on every log call caused playback hitches. Flip to true
+    // only when diagnosing an issue.
+    public static bool Enabled = false;
+
     private static readonly object Gate = new();
     public static readonly string Path;
 
@@ -23,6 +27,7 @@ public static class Log
 
     public static void Write(string msg)
     {
+        if (!Enabled) return;
         try
         {
             var line = $"{DateTime.Now:HH:mm:ss.fff} [t{Environment.CurrentManagedThreadId}] {msg}";

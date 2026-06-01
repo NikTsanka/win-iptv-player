@@ -199,38 +199,22 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         else d.BeginInvoke(action);
     }
 
-    // Watches libvlc's native log. Its main job now: detect a hardware-decode failure on
-    // a 10-bit HDR stream ("Unsupported bitdepth 10" / "Failed to create video converter")
-    // and transparently restart the SAME channel with software decoding forced. 8-bit
-    // channels never hit this, so they keep smooth hardware decode.
+    // HOT PATH: fires for every libvlc log line, so it stays as cheap as possible — no
+    // file I/O. It only watches for a 10-bit-HDR hardware-decode failure and, when seen,
+    // restarts that one channel in software. 8-bit channels never hit this.
     private void OnVlcNativeLog(object? sender, LogEventArgs e)
     {
-        try
-        {
-            var m = e.Message ?? string.Empty;
+        if (_triedSoftwareForCurrent) return;            // already retried (or N/A)
+        var m = e.Message;
+        if (m is null) return;
+        if (!m.Contains("Unsupported bitdepth", StringComparison.OrdinalIgnoreCase) &&
+            !m.Contains("Failed to create video converter", StringComparison.OrdinalIgnoreCase))
+            return;
 
-            var hwDecodeFailed =
-                m.Contains("Unsupported bitdepth", StringComparison.OrdinalIgnoreCase) ||
-                m.Contains("Failed to create video converter", StringComparison.OrdinalIgnoreCase);
-
-            if (hwDecodeFailed)
-            {
-                var ch = _playingChannel;
-                if (ch is not null && !_triedSoftwareForCurrent)
-                {
-                    _triedSoftwareForCurrent = true;     // guard against a retry loop
-                    Log.Write($"HDR/10-bit hw decode failed for #{ch.Number} {ch.Name} -> retry in software");
-                    PostVlc(() => DoPlay(ch, forceSoftware: true));
-                }
-            }
-
-            if (e.Level >= LogLevel.Warning ||
-                m.Contains("vout", StringComparison.OrdinalIgnoreCase) ||
-                m.Contains("bitdepth", StringComparison.OrdinalIgnoreCase) ||
-                m.Contains("converter", StringComparison.OrdinalIgnoreCase))
-                Log.Write($"VLCLOG [{e.Level}] {e.Module}: {m}");
-        }
-        catch { /* never throw from a log callback */ }
+        var ch = _playingChannel;
+        if (ch is null) return;
+        _triedSoftwareForCurrent = true;                 // guard against a retry loop
+        PostVlc(() => DoPlay(ch, forceSoftware: true));
     }
 
     // ---- Filtering -------------------------------------------------------------------
@@ -355,9 +339,20 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             var media = Uri.TryCreate(channel.StreamUrl, UriKind.Absolute, out var uri)
                 ? new Media(_libVLC, uri)
                 : new Media(_libVLC, channel.StreamUrl, FromType.FromPath);
-            media.AddOption(":network-caching=1500");
+
+            // Smooth live IPTV: a larger jitter buffer plus relaxed clock handling fixes
+            // the "picture is too late" stutter (worst in fullscreen). Per-media options
+            // are used because global LibVLC options are ignored on this build.
+            media.AddOption(":network-caching=3000");
+            media.AddOption(":live-caching=3000");
+            media.AddOption(":clock-jitter=0");
+            media.AddOption(":clock-synchro=0");
             if (forceSoftware)
+            {
                 media.AddOption(":avcodec-hw=none");   // per-media (global options ignored)
+                // Software 4K is heavy; skipping the loop filter keeps it watchable.
+                media.AddOption(":avcodec-skiploopfilter=4");
+            }
 
             _playingChannel = channel;
             _triedSoftwareForCurrent = forceSoftware;
