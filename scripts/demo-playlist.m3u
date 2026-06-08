@@ -1,0 +1,13 @@
+#EXTM3U
+#EXTINF:-1 tvg-id="bbb" tvg-logo="https://upload.wikimedia.org/wikipedia/commons/c/c5/Big_buck_bunny_poster_big.jpg" group-title="Demo / Movies",Big Buck Bunny
+https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8
+#EXTINF:-1 tvg-id="sintel" group-title="Demo / Movies",Sintel (4K)
+https://bitdash-a.akamaihd.net/content/sintel/hls/playlist.m3u8
+#EXTINF:-1 tvg-id="tears" group-title="Demo / Movies",Tears of Steel
+https://test-streams.mux.dev/tos_ismc/main.m3u8
+#EXTINF:-1 tvg-id="apple" group-title="Demo / Reference",Apple BipBop Advanced
+https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8
+#EXTINF:-1 tvg-id="bbb-fmp4" group-title="Demo / Reference",Big Buck Bunny (fMP4)
+https://bitdash-a.akamaihd.net/content/MI201109210084_1/m3u8s/f08e80da-bf1d-4e3d-8899-f0f6155f6efa.m3u8
+#EXTINF:-1 tvg-id="cnn" group-title="Demo / News",News Demo Loop
+https://test-streams.mux.dev/pts_shift/master.m3u8
